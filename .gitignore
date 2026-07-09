@@ -64,7 +64,6 @@ reports/
 *.sqlite3
 
 # ignore project memory file with secrets
-PROJECT_MEMORY.md
 
 # 系统文件
 .DS_Store
