@@ -11,11 +11,10 @@ import time
 from typing import Optional
 from datetime import datetime
 
-import markdown2
 import requests
 
 from src.config import Config
-from src.formatters import chunk_markdown_preserving_blocks
+from src.formatters import chunk_content_by_max_bytes, markdown_tables_to_key_value_rows
 
 
 logger = logging.getLogger(__name__)
@@ -33,9 +32,9 @@ class PushplusSender:
         self._pushplus_token = getattr(config, 'pushplus_token', None)
         self._pushplus_topic = getattr(config, 'pushplus_topic', None)
         self._pushplus_max_bytes = getattr(config, 'pushplus_max_bytes', 20000)
-        # HTML 转换会增加约 30%-200% 体积，且 JSON payload 本身有开销；
-        # 按 25% 预留足够余量，避免 PushPlus 报服务端验证错误。
-        self._markdown_budget = max(1000, int(self._pushplus_max_bytes * 0.25))
+        # PushPlus 单条内容上限约 20000 字节；
+        # 预留 JSON payload 开销，Markdown 格式无 HTML 膨胀。
+        self._markdown_budget = max(1000, self._pushplus_max_bytes - 2000)
         
     def send_to_pushplus(
         self,
@@ -52,17 +51,17 @@ class PushplusSender:
         {
             "token": "用户令牌",
             "title": "消息标题",
-            "content": "消息内容（HTML 格式）",
-            "template": "html"
+            "content": "消息内容（Markdown 格式）",
+            "template": "markdown"
         }
 
         PushPlus 特点：
         - 国内推送服务，免费额度充足
         - 支持微信公众号推送
-        - 支持 HTML 消息格式
+        - 支持 Markdown 消息格式
 
         Args:
-            content: 消息内容（Markdown 格式，内部会转成手机友好的 HTML）
+            content: 消息内容（Markdown 格式；内部会把表格转为手机友好的键值行）
             title: 消息标题（可选）
 
         Returns:
@@ -99,52 +98,21 @@ class PushplusSender:
             return False
 
     @staticmethod
-    def _markdown_to_mobile_html(markdown_text: str) -> str:
+    def _format_pushplus_content(markdown_text: str) -> str:
         """
-        把 Markdown 报告转成适合手机微信阅读的 HTML。
+        把 Markdown 报告整理成更适合手机微信阅读的 Markdown。
 
-        使用 inline style，因为部分客户端会过滤 <style> 块。
+        核心优化：把表格转成键值行，避免微信里表格排版错乱。
         """
-        html_content = markdown2.markdown(
-            markdown_text,
-            extras=["tables", "fenced-code-blocks", "break-on-newline", "cuddled-lists"],
-        )
+        # 将表格转为键值列表，保持其他 Markdown 结构不变
+        text = markdown_tables_to_key_value_rows(markdown_text, bullet="•")
 
-        # 包裹容器，设置基础字体和行距
-        container_style = (
-            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
-            "font-size:14px;line-height:1.6;color:#333;"
-        )
+        # 清理连续空行，让段落间距更紧凑
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
-        def style_tag(tag: str, style: str) -> None:
-            nonlocal html_content
-            pattern = re.compile(rf'<{tag}\b([^>]*?)(/?)>')
-            def repl(match):
-                attrs = match.group(1) or ""
-                slash = match.group(2) or ""
-                if 'style=' in attrs:
-                    return match.group(0)
-                return f'<{tag}{attrs} style="{style}"{slash}>'
-            html_content = pattern.sub(repl, html_content)
-
-        style_tag("h1", "font-size:18px;line-height:1.4;color:#1a1a1a;margin:16px 0 8px 0;border-bottom:1px solid #e0e0e0;padding-bottom:4px;")
-        style_tag("h2", "font-size:16px;line-height:1.4;color:#2c3e50;margin:14px 0 6px 0;")
-        style_tag("h3", "font-size:15px;line-height:1.4;color:#34495e;margin:12px 0 5px 0;")
-        style_tag("p", "margin:6px 0;line-height:1.6;font-size:14px;color:#333;")
-        style_tag("strong", "color:#2c3e50;")
-        style_tag("table", "width:100%;border-collapse:collapse;margin:8px 0;font-size:13px;")
-        style_tag("tr", "border-bottom:1px solid #eee;")
-        style_tag("th", "background:#f5f7fa;padding:6px 4px;text-align:left;font-weight:600;border:1px solid #ddd;")
-        style_tag("td", "padding:6px 4px;border:1px solid #eee;vertical-align:top;")
-        style_tag("ul", "margin:4px 0;padding-left:16px;")
-        style_tag("ol", "margin:4px 0;padding-left:16px;")
-        style_tag("li", "margin:3px 0;line-height:1.5;font-size:14px;")
-        style_tag("blockquote", "margin:6px 0;padding:6px 10px;background:#f8f9fa;border-left:3px solid #3498db;color:#555;")
-        style_tag("code", "padding:2px 4px;font-size:85%;background:rgba(27,31,35,0.05);border-radius:3px;font-family:SFMono-Regular,Consolas,monospace;")
-        style_tag("pre", "padding:10px;overflow:auto;line-height:1.45;background:#f6f8fa;border-radius:3px;font-size:12px;")
-        style_tag("hr", "height:1px;padding:0;margin:12px 0;background:#e1e4e8;border:0;")
-
-        return f'<div style="{container_style}">{html_content}</div>'
+        # 在长表格转列表后，部分键值对较长；为提升可读性，
+        # 在二级标题前加一行分隔（markdown 已有 ##，这里无需额外处理）
+        return text.strip()
 
     def _send_pushplus_message(
         self,
@@ -154,13 +122,13 @@ class PushplusSender:
         *,
         timeout_seconds: Optional[float] = None,
     ) -> bool:
-        html_content = self._markdown_to_mobile_html(content)
+        formatted_content = self._format_pushplus_content(content)
 
         payload = {
             "token": self._pushplus_token,
             "title": title,
-            "content": html_content,
-            "template": "html",
+            "content": formatted_content,
+            "template": "markdown",
         }
 
         if self._pushplus_topic:
@@ -175,20 +143,16 @@ class PushplusSender:
                 return True
 
             error_msg = result.get('msg', '未知错误')
-            logger.error(f"PushPlus 返回错误: {error_msg}")
+            error_data = result.get('data')
+            logger.error(f"PushPlus 返回错误: {error_msg}, data={error_data}")
             return False
 
         logger.error(f"PushPlus 请求失败: HTTP {response.status_code}")
         return False
 
     def _send_pushplus_chunked(self, api_url: str, content: str, title: str, markdown_budget: int) -> bool:
-        """分批发送长 PushPlus 消息，尽量在段落/表格边界处分割。"""
-        chunks = chunk_markdown_preserving_blocks(
-            content,
-            markdown_budget,
-            len_fn=lambda s: len(s.encode("utf-8")),
-            add_page_marker=True,
-        )
+        """分批发送长 PushPlus 消息，给 JSON payload 预留空间。"""
+        chunks = chunk_content_by_max_bytes(content, markdown_budget, add_page_marker=True)
         total_chunks = len(chunks)
         success_count = 0
 
