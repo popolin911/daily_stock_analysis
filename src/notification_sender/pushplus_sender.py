@@ -15,7 +15,7 @@ import markdown2
 import requests
 
 from src.config import Config
-from src.formatters import chunk_content_by_max_bytes
+from src.formatters import chunk_markdown_preserving_blocks
 
 
 logger = logging.getLogger(__name__)
@@ -33,8 +33,9 @@ class PushplusSender:
         self._pushplus_token = getattr(config, 'pushplus_token', None)
         self._pushplus_topic = getattr(config, 'pushplus_topic', None)
         self._pushplus_max_bytes = getattr(config, 'pushplus_max_bytes', 20000)
-        # HTML 转换会增加约 30%-80% 体积，预留足够余量
-        self._markdown_budget = max(1000, int(self._pushplus_max_bytes * 0.5))
+        # HTML 转换会增加约 30%-200% 体积，且 JSON payload 本身有开销；
+        # 按 25% 预留足够余量，避免 PushPlus 报服务端验证错误。
+        self._markdown_budget = max(1000, int(self._pushplus_max_bytes * 0.25))
         
     def send_to_pushplus(
         self,
@@ -181,8 +182,13 @@ class PushplusSender:
         return False
 
     def _send_pushplus_chunked(self, api_url: str, content: str, title: str, markdown_budget: int) -> bool:
-        """分批发送长 PushPlus 消息，chunk 预算已扣除 HTML 转换开销。"""
-        chunks = chunk_content_by_max_bytes(content, markdown_budget, add_page_marker=True)
+        """分批发送长 PushPlus 消息，尽量在段落/表格边界处分割。"""
+        chunks = chunk_markdown_preserving_blocks(
+            content,
+            markdown_budget,
+            len_fn=lambda s: len(s.encode("utf-8")),
+            add_page_marker=True,
+        )
         total_chunks = len(chunks)
         success_count = 0
 
